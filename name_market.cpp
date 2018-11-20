@@ -4,8 +4,8 @@ void name_market::lockacnt(account_name account, account_name owner, const autho
     require_auth2(account, N(owner));
 
     // Save reclaim authority and account owner
-    accountlock_table locks(_self, account);
-    locks.emplace(account, [&](accountlock &lock) {
+    accountlocks_table locks(_self, account);
+    locks.emplace(account, [&](accountlock_type &lock) {
         lock.account = account;
         lock.owner = owner;
         lock.reclaim_auth = reclaim_auth;
@@ -23,12 +23,12 @@ void name_market::lockacnt(account_name account, account_name owner, const autho
 
 void name_market::unlockacnt(account_name account) {
     // Get lock from DB
-    accountlock_table locks(_self, account);
-    accountlock lock = locks.get(account, "Unable to find account in lock database");
+    accountlocks_table locks(_self, account);
+    auto &lock = locks.get(account, "Unable to find account in lock database");
 
     require_auth(lock.owner);
 
-    // TODO Check if there are any ongoing auctions
+    eosio_assert(lock.active_auctions == 0, "Cannot unlock an account which still has active auctions");
 
     // Set the owner permission
     action(permission_level{account, N(owner)},
@@ -41,43 +41,60 @@ void name_market::unlockacnt(account_name account) {
 }
 
 void name_market::offername(account_name owner, account_name name,
-                            eosio::asset start_price, uint32_t bidding_timeout_sec) {
+                            asset start_price, uint32_t bidding_timeout_sec) {
     require_auth(owner);
-
-    // TODO Add asserts and modify this to support already created accounts,
-    // specific new names, and empty name (any new subname)
 
     eosio_assert(start_price.symbol == asset().symbol, "Starting price should be in the system token");
     eosio_assert(start_price.amount >= 0, "Starting price should not be negative");
     eosio_assert(bidding_timeout_sec <= 7 * 24 * 60 * 60, "Auction timeout should not be greater than a week");
 
-    offerconfig_table offers(_self, name);
-    auto itr = offers.find(name);
+    if (is_account(name)) {
+        eosio_assert(this->has_account_locked(owner, name),
+                     "The account with this name is not locked under the account of the creator of the offer");
+    } else {
+        account_name suffix = eosio::name_suffix(name);
+        eosio_assert(suffix != name && suffix == owner, "This name cannot be offered by this account");
+        eosio_assert(this->is_account_locked(owner),
+                     "Owner account must be locked in order to offer its subnames");
+    }
 
-    if (itr == offers.end()) {
-        offers.emplace(owner, [&](offerconfig &offer) {
+    offers_table offers(_self, name);
+    auto offer_itr = offers.find(name);
+
+    if (offer_itr == offers.end()) {
+        offers.emplace(owner, [&](offer_type &offer) {
             offer.owner = owner;
             offer.name = name;
             offer.start_price = start_price;
             offer.bidding_timeout_sec = bidding_timeout_sec;
         });
     } else {
-        offers.modify(itr, 0, [&](offerconfig &offer) {
+        offers.modify(offer_itr, 0, [&](offer_type &offer) {
             offer.start_price = start_price;
             offer.bidding_timeout_sec = bidding_timeout_sec;
         });
     }
 }
 
-void name_market::stopoffer(account_name owner, account_name name) {
-    require_auth(owner);
+bool name_market::is_account_locked(account_name account) {
+    accountlocks_table locks(_self, account);
+    auto lock_itr = locks.find(account);
+    return lock_itr != locks.end();
+}
 
-    offerconfig_table offers(_self, _self);
-    auto itr = offers.find(owner);
+bool name_market::has_account_locked(account_name owner, account_name account) {
+    accountlocks_table locks(_self, account);
+    auto lock_itr = locks.find(account);
+    return lock_itr != locks.end() && lock_itr->owner == owner;
+}
 
-    eosio_assert(itr != offers.end(), "This account is not currently offering names");
+void name_market::closeoffer(account_name name) {
+    offers_table offers(_self, name);
+    auto &offer = offers.get(name, "No offer found for the provided name");
 
-    offers.erase(itr);
+    require_auth(offer.owner);
+
+    offers.erase(offer);
 }
 
 void name_market::bidname(account_name bidder, account_name name, asset bid) {
@@ -155,9 +172,7 @@ void name_market::process_bid(account_name bidder, asset bid, auction auc) {
 void name_market::claimname(account_name claimer, account_name name) {
     require_auth(claimer);
 
-    account_name owner = eosio::name_suffix(name);
-    offerconfig_table offerconfigs(_self, _self);
-    offerconfig owner_offer = offerconfigs.get(owner, "could not find offer configuration for namespace owner");
+    // TODO Check that claimer won the auction for the name
 
     const auto auth = authority(1, {permission_level_weight{.permission = {claimer, N(active)}, .weight = 1}});
 
